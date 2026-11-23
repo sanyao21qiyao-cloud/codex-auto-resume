@@ -42,7 +42,9 @@ missing, expired or exhausted quota windows do not authorize an automatic send.
 
 **Checking it worked:** after queueing, it watches for a turn containing this submission's unique
 marker and tries opening the thread again if it does not start within 4 minutes. A different turn
-is not treated as confirmation. A queue receipt alone is not proof that the task ran.
+is not treated as confirmation. A terminal-looking history entry without a completion timestamp
+is treated as unconfirmed, because the desktop turn may still be running. A queue receipt alone
+is not proof that the task ran.
 
 **Uncertain submissions:** an unreadable queue or an existing queued message prevents a new send.
 Before any submission, the helper persists an intent. If the process stops or the queue command

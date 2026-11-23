@@ -344,7 +344,8 @@ with app.mutate_state() as state:
                  "resume_submission_id": token, "resume_kind": "after_limit", "next_check_at": 0}
         app.save_state(state)
         server = mock.MagicMock()
-        snap = {"latest": {"id": "new-turn", "submission_id": token, "status": "failed"}, "goal": None}
+        snap = {"latest": {"id": "new-turn", "submission_id": token, "status": "failed",
+                           "completed_at": 999_999}, "goal": None}
         with mock.patch.object(app, "AppServer", return_value=server), \
              mock.patch.object(app, "read_snapshot", return_value=snap), \
              mock.patch.object(app, "classify", return_value=("stop", "turn failed")), \
@@ -354,6 +355,58 @@ with app.mutate_state() as state:
         self.assertNotIn("resume_started_verified_at", saved)
         self.assertNotIn("resume_confirmed", [event["event"] for event in saved["history"]])
         self.assertNotIn("Codex task resumed", [call.args[1] for call in notify.call_args_list])
+
+    def test_interrupted_projection_without_completion_stays_unconfirmed(self):
+        token = "a" * 32
+        for deadline in (1_000_100, 999_999):
+            with self.subTest(deadline=deadline):
+                state = {**self.state, "phase": "resuming", "resume_turn_before": "failed-turn",
+                         "resume_queue_id": "queue-receipt", "resume_submission_id": token,
+                         "resume_deadline": deadline, "next_check_at": 0}
+                app.save_state(state)
+                server = mock.MagicMock()
+                snap = {"latest": {"id": "new-turn", "submission_id": token, "status": "interrupted",
+                                   "completed_at": None}, "goal": None}
+                with mock.patch.object(app, "now", return_value=1_000_000), \
+                     mock.patch.object(app, "AppServer", return_value=server), \
+                     mock.patch.object(app, "read_snapshot", return_value=snap), \
+                     mock.patch.object(app, "classify", return_value=("stop", "interrupted")):
+                    app.tick(dict(self.cfg, notifications=False), mock.Mock())
+                saved = app.load_state()
+                self.assertEqual(saved["phase"], "resuming")
+                self.assertNotIn("resume_started_verified_at", saved)
+                self.assertFalse(app.has_unresolved_submission(saved))
+
+    def test_nonfinal_history_status_is_pending_not_interrupted(self):
+        for status in ("interrupted", "failed", "completed"):
+            with self.subTest(status=status):
+                snap = {"latest": {"id": "turn", "status": status, "completed_at": None,
+                                   "error_code": "usageLimitExceeded"}, "goal": None}
+                self.assertEqual(app.classify(snap, self.state, self.cfg)[0], "pending")
+
+    def test_working_task_with_nonfinal_projection_is_not_stopped(self):
+        app.save_state({**self.state, "phase": "working", "next_check_at": 0})
+        server = mock.MagicMock()
+        snap = {"latest": {"id": "new-turn", "status": "interrupted", "completed_at": None,
+                           "error_code": None}, "goal": None}
+        with mock.patch.object(app, "AppServer", return_value=server), \
+             mock.patch.object(app, "read_snapshot", return_value=snap), \
+             mock.patch.object(app, "do_resume") as send:
+            app.tick(dict(self.cfg, notifications=False), mock.Mock())
+            send.assert_not_called()
+        self.assertEqual(app.load_state()["phase"], "pending")
+
+    def test_manual_send_rejects_nonfinal_projection_even_with_force(self):
+        server = mock.MagicMock()
+        server.__enter__.return_value.call.return_value = {}
+        snap = {"latest": {"id": "new-turn", "status": "interrupted", "completed_at": None,
+                           "error_code": None}, "goal": None}
+        with mock.patch.object(app, "AppServer", return_value=server), \
+             mock.patch.object(app, "read_snapshot", return_value=snap), \
+             mock.patch.object(app, "do_resume") as send:
+            with self.assertRaisesRegex(SystemExit, "not final"):
+                app.cmd_resume_now(self.cfg, SimpleNamespace(force=True, yes=True))
+            send.assert_not_called()
 
     def test_queued_submission_is_preserved_when_disarmed_or_cancelled(self):
         for command in (app.cmd_disarm, app.cmd_cancel):

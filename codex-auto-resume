@@ -567,7 +567,7 @@ def read_checkpoint(cwd: str | None):
 # ----------------------------------------------------------------------------------- classification
 
 def classify(snap: dict, st: dict, cfg: dict):
-    """Return (verdict, reason). Verdicts: stop, complete, working, limited, continue, idle."""
+    """Return (verdict, reason). Unknown final status stays pending."""
     if snap.get("missing"):
         return "stop", "the thread no longer exists"
     if snap.get("archived"):
@@ -590,6 +590,8 @@ def classify(snap: dict, st: dict, cfg: dict):
         return "idle", "no turns yet"
     if latest["status"] == "inProgress":
         return "working", "a turn is in progress"
+    if latest["status"] in ("completed", "failed", "interrupted") and not latest.get("completed_at"):
+        return "pending", "turn completion has not been recorded"
     if latest["error_code"] == "usageLimitExceeded":
         if st.get("cancelled_turn_id") == latest["id"]:
             return "idle", "scheduled resume was cancelled for this limit event"
@@ -846,6 +848,15 @@ def tick(cfg: dict, caf: Caffeinate) -> float:
                     stop(cfg, s, "the matching continuation has an unknown status and needs review")
                     caf.release()
                     return 3600
+                # An interrupted history projection without completedAt can still be running in Desktop.
+                if status in ("completed", "failed", "interrupted") and not latest.get("completed_at"):
+                    if not s.get("resume_projection_pending"):
+                        add_event(s, "resume_projection_pending", "matching turn has no final timestamp")
+                    s["resume_projection_pending"] = True
+                    s["next_check_at"] = now() + cfg["poll_resuming_secs"]
+                    caf.set(None)
+                    return cfg["poll_resuming_secs"]
+                s.pop("resume_projection_pending", None)
                 if status in ("inProgress", "completed"):
                     add_event(s, "resume_confirmed", "new turn %s started" % latest["id"][-12:])
                     s["resume_started_turn_id"] = latest["id"]
@@ -883,6 +894,10 @@ def tick(cfg: dict, caf: Caffeinate) -> float:
             if now() - (s.get("last_resume_at") or 0) > 900:
                 s["backoff_level"] = 0  # the last resume made real progress
             s.update(phase="working", next_check_at=now() + cfg["poll_working_secs"])
+        elif verdict == "pending":
+            if phase != "pending":
+                add_event(s, "projection_pending", reason)
+            s.update(phase="pending", next_check_at=now() + cfg["poll_resuming_secs"])
         elif verdict == "idle":
             if phase != "idle":
                 add_event(s, "idle", reason)
@@ -1107,6 +1122,8 @@ def cmd_resume_now(cfg, args):
         raise SystemExit("Refusing: %s." % reason)
     if verdict == "working":
         raise SystemExit("Codex is already working on this thread (%s)." % reason)
+    if verdict == "pending":
+        raise SystemExit("Codex turn status is not final; no continuation sent.")
     if verdict == "idle" and not (args.force or args.yes):
         if not sys.stdin.isatty():
             raise SystemExit("Codex is not stopped at a usage limit (%s). Pass --yes to send anyway." % reason)
