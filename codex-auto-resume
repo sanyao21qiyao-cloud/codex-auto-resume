@@ -372,12 +372,57 @@ def pending_queue_items(tid: str):
     return None if rows is None else [r[0] for r in rows]
 
 
-def lock_holders(tid: str) -> list:
+def desktop_server_pids(cfg: dict) -> list:
+    cli = Path(cfg["codex_cli"]).resolve()
+    app = next((p for p in cli.parents if p.suffix == ".app" and
+                (p / "Contents/MacOS" / cfg["codex_app_process"]).is_file()), None)
+    if app is None:
+        raise AppServerError("configured Codex CLI is not inside the Desktop app")
+    try:
+        result = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,comm="],
+                                capture_output=True, text=True, timeout=5, check=True)
+        processes = {}
+        for line in result.stdout.splitlines():
+            match = re.match(r"\s*(\d+)\s+(\d+)\s+(.+?)\s*$", line)
+            if match:
+                processes[int(match.group(1))] = (int(match.group(2)), match.group(3))
+        main = str(app / "Contents/MacOS" / cfg["codex_app_process"])
+        roots = {pid for pid, (_, path) in processes.items() if path == main}
+        parents = roots | {pid for pid, (ppid, path) in processes.items()
+                           if ppid in roots and path.startswith(str(app) + "/") and path != str(cli)}
+        candidates = [pid for pid, (ppid, path) in processes.items()
+                      if ppid in parents and path == str(cli)]
+        if not candidates:
+            return []
+        result = subprocess.run(["/bin/ps", "-p", ",".join(map(str, candidates)), "-o", "pid=,args="],
+                                capture_output=True, text=True, timeout=5, check=True)
+        servers = []
+        for line in result.stdout.splitlines():
+            match = re.match(r"\s*(\d+)\s+(.+)", line)
+            if (match and int(match.group(1)) in candidates and
+                    re.search(r"(?:^|\s)app-server(?:\s|$)", match.group(2))):
+                servers.append(int(match.group(1)))
+        return servers
+    except (OSError, subprocess.SubprocessError) as e:
+        raise AppServerError("cannot inspect Codex Desktop processes") from e
+
+
+def lock_holders(cfg: dict, tid: str) -> list:
     lock = CODEX_HOME / "thread-writer-locks" / ("%s.lock" % tid)
     if not lock.exists():
         return []
-    r = subprocess.run(["/usr/sbin/lsof", "-t", str(lock)], capture_output=True, text=True)
-    return [int(p) for p in r.stdout.split() if p.strip().isdigit()]
+    servers = desktop_server_pids(cfg)
+    if not servers:
+        return []
+    try:
+        r = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-p", ",".join(map(str, servers)),
+                            "-t", str(lock)], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise AppServerError("cannot inspect thread ownership") from e
+    if r.returncode not in (0, 1) or (r.returncode == 1 and r.stderr.strip()):
+        raise AppServerError("cannot inspect thread ownership")
+    holders = {int(p) for p in r.stdout.split() if p.isdigit()}
+    return sorted(holders.intersection(desktop_server_pids(cfg)))
 
 
 def codex_app_running(cfg: dict) -> bool:
@@ -589,18 +634,20 @@ def codex_queue(cfg: dict, tid: str, message: str) -> str:
 
 
 def ensure_loaded(cfg: dict, tid: str) -> str:
-    holders = lock_holders(tid)
+    holders = lock_holders(cfg, tid)
     if holders:
-        return "loaded (pid %s)" % ",".join(map(str, holders))
+        return "desktop app-server has lock file open (pid %s)" % ",".join(map(str, holders))
     running = codex_app_running(cfg)
-    subprocess.run(["/usr/bin/open", "-g", "codex://threads/%s" % tid], timeout=30)
+    subprocess.run(["/usr/bin/open", "-g", "codex://threads/%s" % tid], timeout=30, check=True)
+    if not wait_for_owner(cfg, tid, 45):
+        raise AppServerError("Codex Desktop did not open the thread lock file")
     return "opened via deep link (Codex was %s)" % ("running" if running else "not running; launched")
 
 
-def wait_for_owner(tid: str, timeout: float) -> bool:
+def wait_for_owner(cfg: dict, tid: str, timeout: float) -> bool:
     deadline = now() + timeout
     while now() < deadline:
-        if lock_holders(tid):
+        if lock_holders(cfg, tid):
             return True
         time.sleep(3)
     return False
@@ -643,20 +690,20 @@ def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> bool:
     })
     # Persist before any side effect; an interrupted attempt must never be retried blindly.
     save_state(st)
-    # Make sure Codex Desktop (not this helper) owns the thread before touching it.
+    # shortcut: an open lock file does not prove idle state; upgrade when native preflight is available.
     load_note = ensure_loaded(cfg, tid)
     if not queue_is_clear(cfg, st, tid):
         st["phase"] = previous_phase
         st.pop("unresolved_submission")
         return False
     if st.get("mode") == "goal":
-        if wait_for_owner(tid, 45):
+        if wait_for_owner(cfg, tid, 45):
             try:
                 add_event(st, "goal_reactivate", "status -> %s" % reactivate_goal(cfg, tid))
             except Exception as e:
                 add_event(st, "goal_reactivate_failed", str(e)[:200])
         else:
-            add_event(st, "goal_reactivate_skipped", "thread not loaded by Codex yet; sending message only")
+            raise AppServerError("Codex Desktop no longer has the thread lock file open")
     qid = codex_queue(cfg, tid, prompt)
     st["resume_count"] = st.get("resume_count", 0) + 1
     st.update(phase="resuming", resume_kind=kind, resume_queue_id=qid, resume_turn_before=latest.get("id"),
@@ -1066,7 +1113,7 @@ def cmd_check(cfg, args):
     print("archived:   %s   goal: %s" % (snap.get("archived"), (snap.get("goal") or {}).get("status")))
     for t in snap.get("turns", []):
         print("turn:       %s %-11s %s%s" % (t["id"][-12:], t["status"], t["error_code"] or "", "  (sent by helper)" if t["by_helper"] else ""))
-    print("loaded by:  %s" % (lock_holders(tid) or "nobody (would deep-link)"))
+    print("lock open:  %s" % (lock_holders(cfg, tid) or "not open by Codex Desktop (would deep-link)"))
     print("queued:     %s" % pending_queue_items(tid))
     print("usage:      allowed=%s  exhausted-window reset=%s" % (rl["allowed"], fmt_time(rl["reset_at"])))
     if snap.get("latest") and snap["latest"].get("error_message"):

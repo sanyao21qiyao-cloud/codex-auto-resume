@@ -197,6 +197,69 @@ with app.mutate_state() as state:
                 with self.assertRaises(SystemExit):
                     app.cmd_resume_now(self.cfg, SimpleNamespace(force=True, yes=True))
 
+    def test_only_desktop_app_server_is_checked_for_open_lock_file(self):
+        root = Path(self.temp.name).resolve() / "ChatGPT.app"
+        main = root / "Contents/MacOS/ChatGPT"
+        cli = root / "Contents/Resources/CodexCLI.app/Contents/MacOS/codex"
+        for executable in (main, cli):
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.touch()
+        helper = root / "Contents/Frameworks/desktop-helper"
+        lock = root / "thread-writer-locks/test-thread.lock"
+        lock.parent.mkdir()
+        lock.touch()
+        cfg = dict(self.cfg, codex_cli=str(cli))
+        table = "\n".join([
+            f"100 1 {main}", f"101 100 {helper}", f"102 101 {cli}",
+            f"103 102 {cli}", f"104 1 {cli}", f"105 100 {cli}", f"106 105 {cli}",
+        ])
+        args = f"102 {cli} app-server\n105 {cli} exec-server\n106 {cli} app-server\n"
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            if command[0] == "/usr/sbin/lsof":
+                return SimpleNamespace(returncode=0, stdout="102\n104\n", stderr="")
+            if "-A" in command:
+                return SimpleNamespace(returncode=0, stdout=table, stderr="")
+            return SimpleNamespace(returncode=0, stdout=args, stderr="")
+
+        with mock.patch.object(app, "CODEX_HOME", root), \
+             mock.patch.object(app.subprocess, "run", side_effect=run):
+            self.assertEqual(app.lock_holders(cfg, "test-thread"), [102])
+        lsof = [call for call in calls if call[0][0] == "/usr/sbin/lsof"]
+        self.assertEqual(len(lsof), 1)
+        self.assertEqual(lsof[0][0][lsof[0][0].index("-p") + 1], "102")
+        self.assertEqual(lsof[0][1]["timeout"], 5)
+
+    def test_ownership_timeout_fails_closed(self):
+        lock = Path(self.temp.name) / "thread-writer-locks/test-thread.lock"
+        lock.parent.mkdir()
+        lock.touch()
+        with mock.patch.object(app, "CODEX_HOME", Path(self.temp.name)), \
+             mock.patch.object(app, "desktop_server_pids", return_value=[102]), \
+             mock.patch.object(app.subprocess, "run", side_effect=subprocess.TimeoutExpired("lsof", 5)):
+            with self.assertRaisesRegex(app.AppServerError, "ownership"):
+                app.lock_holders(self.cfg, "test-thread")
+
+    def test_disappearing_server_is_not_counted(self):
+        lock = Path(self.temp.name) / "thread-writer-locks/test-thread.lock"
+        lock.parent.mkdir()
+        lock.touch()
+        result = SimpleNamespace(returncode=0, stdout="102\n", stderr="")
+        with mock.patch.object(app, "CODEX_HOME", Path(self.temp.name)), \
+             mock.patch.object(app, "desktop_server_pids", side_effect=[[102], [103]]), \
+             mock.patch.object(app.subprocess, "run", return_value=result):
+            self.assertEqual(app.lock_holders(self.cfg, "test-thread"), [])
+
+    def test_open_without_desktop_lock_file_does_not_proceed(self):
+        with mock.patch.object(app, "lock_holders", return_value=[]), \
+             mock.patch.object(app, "codex_app_running", return_value=True), \
+             mock.patch.object(app, "wait_for_owner", return_value=False), \
+             mock.patch.object(app.subprocess, "run"):
+            with self.assertRaisesRegex(app.AppServerError, "did not open"):
+                app.ensure_loaded(self.cfg, "test-thread")
+
 
 if __name__ == "__main__":
     unittest.main()

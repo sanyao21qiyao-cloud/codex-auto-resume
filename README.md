@@ -28,8 +28,9 @@ Everything goes through Codex's own local interfaces; there's no UI automation.
   per-thread message queue, drained by whichever Codex process owns the thread, normally the
   desktop app. For goal threads it also flips the goal back to `active`, so Codex's own goal loop
   continues.
-- **Loading the thread:** if the thread isn't loaded anywhere, `open -g codex://threads/<id>` asks
-  the desktop app to load it first.
+- **Loading the thread:** if the desktop app-server does not have the thread's lock file open,
+  `open -g codex://threads/<id>` asks it to load the thread, then waits for that file to be open.
+  A file open only in another process is not sufficient.
 
 Only one thread can be armed at a time. Nothing is ever sent unless the armed thread's latest turn
 ended with a usage-limit error, or you run `resume-now` yourself.
@@ -46,6 +47,8 @@ Before any submission, the helper persists an intent. If the process stops or th
 fails before a receipt is recorded, the attempt stays unresolved and is never sent again
 automatically. Inspect the thread and its queue before any manual recovery; disarming does not
 erase the unresolved intent, and arming or resetting is blocked while it remains unresolved.
+An open lock file alone does not prove exclusive ownership or that the thread is idle. The queue
+API does not provide an atomic check against intervening user actions.
 
 **Keeping the Mac awake:** it prevents idle sleep while the armed task is working. While waiting
 for a reset it does the same, but only on mains power and only if the reset is less than 6 hours
