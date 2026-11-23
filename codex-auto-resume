@@ -174,22 +174,31 @@ def state_lock():
 def load_state() -> dict:
     try:
         st = json.loads(STATE_PATH.read_text())
+        if not isinstance(st, dict):
+            raise ValueError("state must be an object")
         base = default_state()
         base.update(st)
         return base
     except FileNotFoundError:
         return default_state()
     except Exception as e:
-        log.error("state.json unreadable (%s); starting disarmed", e)
-        return default_state()
+        raise RuntimeError("state.json unreadable; refusing to overwrite it") from e
 
 
 def save_state(st: dict) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     st["updated_at"] = now()
     tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(st, indent=2, sort_keys=True))
+    with tmp.open("w") as f:
+        f.write(json.dumps(st, indent=2, sort_keys=True))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, STATE_PATH)
+    fd = os.open(APP_DIR, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 @contextlib.contextmanager
@@ -204,6 +213,10 @@ def add_event(st: dict, kind: str, detail: str = "") -> None:
     st.setdefault("history", []).append({"ts": now(), "event": kind, "detail": detail})
     st["history"] = st["history"][-100:]
     log.info("[%s] %s %s", (st.get("thread_id") or "-")[:13], kind, detail)
+
+
+def has_unresolved_submission(st: dict) -> bool:
+    return "unresolved_submission" in st or st.get("phase") == "submission_unknown"
 
 
 def signal_daemon() -> bool:
@@ -599,16 +612,43 @@ def reactivate_goal(cfg: dict, tid: str) -> str:
     return (g.get("goal") or {}).get("status", "?")
 
 
-def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> None:
+def queue_is_clear(cfg: dict, st: dict, tid: str) -> bool:
+    pending = pending_queue_items(tid)
+    if pending is None or pending:
+        st["next_check_at"] = now() + cfg["poll_resuming_secs"]
+        if pending is None:
+            add_event(st, "queue_unavailable", "queue state is unknown; not sending")
+        else:
+            add_event(st, "queue_pending", "%d message(s) already queued; not sending" % len(pending))
+        return False
+    return True
+
+
+def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> bool:
     """Send exactly one continuation to the armed thread. Caller holds the state lock."""
     tid = st["thread_id"]
+    if has_unresolved_submission(st):
+        add_event(st, "submission_unknown", "previous submission requires review; not sending")
+        return False
     if st.get("resume_count", 0) >= st.get("max_resumes", cfg["max_resumes"]):
         stop(cfg, st, "safety stop: reached the maximum of %d automatic resumes" % st.get("max_resumes"))
-        return
-    pending = pending_queue_items(tid)
+        return False
+    if not queue_is_clear(cfg, st, tid):
+        return False
     latest = snap.get("latest") or {}
+    prompt = build_prompt(st, cfg)
+    previous_phase = st.get("phase")
+    st.update(phase="submission_unknown", unresolved_submission={
+        "thread_id": tid, "turn_before": latest.get("id"), "kind": kind, "started_at": now(),
+    })
+    # Persist before any side effect; an interrupted attempt must never be retried blindly.
+    save_state(st)
     # Make sure Codex Desktop (not this helper) owns the thread before touching it.
     load_note = ensure_loaded(cfg, tid)
+    if not queue_is_clear(cfg, st, tid):
+        st["phase"] = previous_phase
+        st.pop("unresolved_submission")
+        return False
     if st.get("mode") == "goal":
         if wait_for_owner(tid, 45):
             try:
@@ -617,16 +657,14 @@ def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> None:
                 add_event(st, "goal_reactivate_failed", str(e)[:200])
         else:
             add_event(st, "goal_reactivate_skipped", "thread not loaded by Codex yet; sending message only")
-    if pending:
-        add_event(st, "queue_pending", "%d message(s) already queued for this thread; not adding another" % len(pending))
-        qid = pending[0]
-    else:
-        qid = codex_queue(cfg, tid, build_prompt(st, cfg))
-        st["resume_count"] = st.get("resume_count", 0) + 1
+    qid = codex_queue(cfg, tid, prompt)
+    st["resume_count"] = st.get("resume_count", 0) + 1
     st.update(phase="resuming", resume_kind=kind, resume_queue_id=qid, resume_turn_before=latest.get("id"),
               last_resume_at=now(), resume_deadline=now() + cfg["resume_verify_secs"], resume_attempts=1,
               next_check_at=now() + cfg["poll_resuming_secs"])
+    st.pop("unresolved_submission", None)
     add_event(st, "resume_sent", "%s #%d queue=%s; %s" % (kind, st.get("resume_count", 0), qid, load_note))
+    return True
 
 
 def stop(cfg: dict, st: dict, reason: str, complete: bool = False) -> None:
@@ -668,6 +706,9 @@ def schedule_from_limit(cfg: dict, st: dict, latest: dict, rl: dict) -> None:
 def tick(cfg: dict, caf: Caffeinate) -> float:
     st = load_state()
     if not st.get("armed"):
+        caf.release()
+        return 3600
+    if has_unresolved_submission(st):
         caf.release()
         return 3600
     gen, tid = st["generation"], st["thread_id"]
@@ -869,6 +910,8 @@ def cmd_threads(cfg, args):
 
 
 def cmd_arm(cfg, args):
+    if has_unresolved_submission(load_state()):
+        raise SystemExit("Previous submission is unresolved; inspect it before arming another thread.")
     if args.thread:
         t = resolve_thread(cfg, args.thread)
     else:
@@ -892,6 +935,8 @@ def cmd_arm(cfg, args):
         raise SystemExit("The thread's goal is %s; resume it in Codex first (or pass --force)." % goal["status"])
     latest = snap.get("latest")
     with mutate_state() as st:
+        if has_unresolved_submission(st):
+            raise SystemExit("Previous submission is unresolved; inspect it before arming another thread.")
         hist = st.get("history", [])
         st.clear()
         st.update(default_state())
@@ -940,6 +985,8 @@ def cmd_resume_now(cfg, args):
     st = load_state()
     if not st.get("armed"):
         raise SystemExit("Not armed. Arm a thread first.")
+    if has_unresolved_submission(st):
+        raise SystemExit("Previous submission is unresolved; inspect it before sending again.")
     with AppServer(cfg["codex_cli"]) as srv:
         snap = read_snapshot(srv, st["thread_id"])
         rl = analyze_rate_limits(srv.call("account/rateLimits/read"))
@@ -961,9 +1008,12 @@ def cmd_resume_now(cfg, args):
             raise SystemExit("State changed meanwhile; try again.")
         s["generation"] = int(now() * 1000)
         add_event(s, "resume_now", "requested by user")
-        do_resume(cfg, s, snap, "manual")
+        sent = do_resume(cfg, s, snap, "manual")
     signal_daemon()
-    print("Continuation sent to %s." % st["thread_id"])
+    if not sent:
+        print("No continuation sent; check status for the reason.")
+        return 2
+    print("Continuation queued for %s; awaiting a verified start." % st["thread_id"])
 
 
 def cmd_status(cfg, args):
@@ -974,6 +1024,8 @@ def cmd_status(cfg, args):
     pid = daemon_pid()
     print("daemon:   %s" % ("running (pid %d)" % pid if pid else "NOT RUNNING"))
     print("armed:    %s   phase: %s" % ("yes" if st.get("armed") else "no", st.get("phase")))
+    if has_unresolved_submission(st):
+        print("WARNING: Previous submission may have been sent; inspect it before trying again.")
     if st.get("thread_id"):
         print("thread:   %s  %s" % (st["thread_id"], st.get("thread_title") or ""))
         print("mode:     %s%s%s" % (st.get("mode"), "  goal=%s" % st["goal_status"] if st.get("goal_status") else "",
@@ -1033,6 +1085,8 @@ def cmd_logs(cfg, args):
 
 def cmd_reset(cfg, args):
     with mutate_state() as st:
+        if has_unresolved_submission(st):
+            raise SystemExit("Previous submission is unresolved; inspect it before resetting state.")
         st.clear()
         st.update(default_state())
         st["generation"] = int(now() * 1000)

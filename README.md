@@ -38,8 +38,14 @@ ended with a usage-limit error, or you run `resume-now` yourself.
 reset time is known, or a resume hits the limit again, it backs off: 10, 20, 40, 60, then 120
 minutes.
 
-**Checking it worked:** after queueing, it watches for the continuation to start, and tries again
-if it doesn't within 4 minutes.
+**Checking it worked:** after queueing, it watches for a new turn and tries opening the thread
+again if it does not start within 4 minutes. A queue receipt alone is not proof that the task ran.
+
+**Uncertain submissions:** an unreadable queue or an existing queued message prevents a new send.
+Before any submission, the helper persists an intent. If the process stops or the queue command
+fails before a receipt is recorded, the attempt stays unresolved and is never sent again
+automatically. Inspect the thread and its queue before any manual recovery; disarming does not
+erase the unresolved intent, and arming or resetting is blocked while it remains unresolved.
 
 **Keeping the Mac awake:** it prevents idle sleep while the armed task is working. While waiting
 for a reset it does the same, but only on mains power and only if the reset is less than 6 hours
