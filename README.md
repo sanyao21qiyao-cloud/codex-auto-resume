@@ -53,6 +53,7 @@ automatically. Inspect the thread and its queue before any manual recovery; disa
 erase the unresolved intent, and arming or resetting is blocked while it remains unresolved.
 Disarming or cancelling does not remove a message already accepted by the Codex queue; it may
 still run and must be inspected separately.
+The submission ledger survives rearming and reset; this helper will not submit the same failed turn twice.
 An open lock file alone does not prove exclusive ownership or that the thread is idle. The queue
 API does not provide an atomic check against intervening user actions.
 
@@ -100,7 +101,7 @@ To remove it:
 | `config [key] [value]` | show or change settings |
 | `doctor` | check the installation |
 | `notify-test` | send a test notification |
-| `reset` | clear all stored state |
+| `reset` | clear monitoring state while preserving the submission ledger |
 
 `--checkpoint` asks Codex to keep a short `.codex/resume.md` in the working directory: objective,
 work done, work remaining, blockers and checks still to run. That file ends with

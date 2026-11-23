@@ -52,6 +52,60 @@ class SubmissionSafetyTests(unittest.TestCase):
                     send.assert_not_called()
                     self.assertNotIn("unresolved_submission", app.load_state())
 
+    def test_same_failed_turn_is_not_submitted_twice(self):
+        state = {**self.state, "submission_ledger": {
+            "test-thread:failed-turn": {"phase": "queued", "queue_id": "old-receipt"}}}
+        app.save_state(state)
+        with mock.patch.object(app, "codex_queue") as send, \
+             mock.patch.object(app, "ensure_loaded") as load:
+            with app.mutate_state() as saved:
+                self.assertFalse(app.do_resume(dict(self.cfg, notifications=False), saved, self.snap, "after_limit"))
+            send.assert_not_called()
+            load.assert_not_called()
+
+    def test_new_failed_turn_can_be_submitted_after_previous_turn(self):
+        state = {**self.state, "submission_ledger": {
+            "test-thread:old-turn": {"phase": "queued", "queue_id": "old-receipt"}}}
+        app.save_state(state)
+        with mock.patch.object(app, "pending_queue_items", return_value=[]), \
+             mock.patch.object(app, "ensure_loaded", return_value="loaded"), \
+             mock.patch.object(app, "codex_queue", return_value="new-receipt"):
+            with app.mutate_state() as saved:
+                self.assertTrue(app.do_resume(self.cfg, saved, self.snap, "after_limit"))
+        ledger = app.load_state()["submission_ledger"]
+        self.assertEqual(ledger["test-thread:old-turn"]["queue_id"], "old-receipt")
+        self.assertEqual(ledger["test-thread:failed-turn"]["queue_id"], "new-receipt")
+
+    def test_rearming_preserves_legacy_receipt(self):
+        state = {**self.state, "phase": "waiting_reset", "resume_queue_id": "old-receipt",
+                 "resume_turn_before": "old-turn", "resume_submission_id": "a" * 32}
+        app.save_state(state)
+        task = {"id": "test-thread", "title": "test", "cwd": None}
+        snap = {"title": "test", "goal": None, "latest": {"id": "new-turn", "status": "failed",
+                "error_code": "usageLimitExceeded"}}
+        args = SimpleNamespace(thread="test-thread", yes=True, force=False, checkpoint=False, max_resumes=1)
+        with mock.patch.object(app, "resolve_thread", return_value=task), \
+             mock.patch.object(app, "AppServer", return_value=mock.MagicMock()), \
+             mock.patch.object(app, "read_snapshot", return_value=snap), \
+             mock.patch.object(app, "signal_daemon", return_value=False):
+            app.cmd_arm(self.cfg, args)
+        saved = app.load_state()
+        self.assertEqual(saved["submission_ledger"]["test-thread:old-turn"]["queue_id"], "old-receipt")
+        self.assertEqual(saved["resume_count"], 0)
+
+    def test_reset_preserves_submission_ledger(self):
+        app.save_state({**self.state, "submission_ledger": {
+            "test-thread:failed-turn": {"phase": "queued", "queue_id": "old-receipt"}}})
+        with mock.patch.object(app, "signal_daemon"):
+            app.cmd_reset(self.cfg, None)
+        self.assertIn("test-thread:failed-turn", app.load_state()["submission_ledger"])
+
+    def test_corrupt_submission_ledger_never_allows_a_send(self):
+        with mock.patch.object(app, "codex_queue") as send:
+            with self.assertRaisesRegex(RuntimeError, "ledger unreadable"):
+                app.do_resume(self.cfg, {**self.state, "submission_ledger": []}, self.snap, "after_limit")
+            send.assert_not_called()
+
     def test_missing_queue_database_is_not_created_or_treated_as_empty(self):
         directory = Path(self.temp.name) / "missing-codex-home"
         with mock.patch.object(app, "CODEX_HOME", directory), \

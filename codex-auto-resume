@@ -234,6 +234,21 @@ def preserve_outstanding_submission(st: dict, reason: str) -> None:
         }
 
 
+def submission_ledger(st: dict) -> dict:
+    ledger = st.setdefault("submission_ledger", {})
+    if not isinstance(ledger, dict):
+        raise RuntimeError("submission ledger unreadable; refusing to send")
+    receipt = st.get("resume_queue_id")
+    if receipt is not None:
+        tid, turn = st.get("thread_id"), st.get("resume_turn_before")
+        if not all(isinstance(v, str) and v for v in (receipt, tid, turn)):
+            raise RuntimeError("previous submission is incomplete; refusing to send")
+        key = "%s:%s" % (tid, turn)
+        ledger.setdefault(key, {"thread_id": tid, "turn_before": turn, "queue_id": receipt,
+                                "submission_id": st.get("resume_submission_id"), "phase": "queued"})
+    return ledger
+
+
 def signal_daemon() -> bool:
     try:
         pid = int(PID_PATH.read_text().strip())
@@ -717,16 +732,26 @@ def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> bool:
     if st.get("resume_count", 0) >= st.get("max_resumes", cfg["max_resumes"]):
         stop(cfg, st, "safety stop: reached the maximum of %d automatic resumes" % st.get("max_resumes"))
         return False
+    latest = snap.get("latest") or {}
+    turn_id = latest.get("id")
+    if not isinstance(turn_id, str) or not turn_id:
+        stop(cfg, st, "the previous turn is unknown; refusing to send")
+        return False
+    ledger = submission_ledger(st)
+    key = "%s:%s" % (tid, turn_id)
+    if key in ledger:
+        stop(cfg, st, "a continuation for this exact turn was already submitted")
+        return False
     if not queue_is_clear(cfg, st, tid):
         return False
-    latest = snap.get("latest") or {}
     submission_id = uuid.uuid4().hex
     prompt = build_prompt(st, cfg) + "\n\n%s submission=%s" % (MARKER, submission_id)
     previous_phase = st.get("phase")
     st.update(phase="submission_unknown", unresolved_submission={
-        "thread_id": tid, "turn_before": latest.get("id"), "kind": kind, "started_at": now(),
+        "thread_id": tid, "turn_before": turn_id, "kind": kind, "started_at": now(),
         "submission_id": submission_id,
     })
+    ledger[key] = {**st["unresolved_submission"], "phase": "sending"}
     # Persist before any side effect; an interrupted attempt must never be retried blindly.
     save_state(st)
     # shortcut: an open lock file does not prove idle state; upgrade when native preflight is available.
@@ -734,6 +759,7 @@ def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> bool:
     if not queue_is_clear(cfg, st, tid):
         st["phase"] = previous_phase
         st.pop("unresolved_submission")
+        del ledger[key]
         return False
     if st.get("mode") == "goal":
         if wait_for_owner(cfg, tid, 45):
@@ -744,6 +770,7 @@ def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> bool:
         else:
             raise AppServerError("Codex Desktop no longer has the thread lock file open")
     qid = codex_queue(cfg, tid, prompt)
+    ledger[key].update(phase="queued", queue_id=qid)
     st["resume_count"] = st.get("resume_count", 0) + 1
     st.update(phase="resuming", resume_kind=kind, resume_queue_id=qid, resume_turn_before=latest.get("id"),
               resume_submission_id=submission_id,
@@ -1054,9 +1081,10 @@ def cmd_arm(cfg, args):
         if has_outstanding_submission(st):
             raise SystemExit("Previous submission is outstanding; inspect it before arming another thread.")
         hist = st.get("history", [])
+        ledger = submission_ledger(st)
         st.clear()
         st.update(default_state())
-        st.update(history=hist, armed=True, phase="watching", generation=int(now() * 1000),
+        st.update(history=hist, submission_ledger=ledger, armed=True, phase="watching", generation=int(now() * 1000),
                   thread_id=t["id"], thread_title=snap.get("title") or t["title"], cwd=snap.get("cwd"),
                   mode=mode, checkpoint=bool(args.checkpoint), armed_at=now(),
                   max_resumes=args.max_resumes or cfg["max_resumes"], resume_count=0, backoff_level=0,
@@ -1216,8 +1244,10 @@ def cmd_reset(cfg, args):
     with mutate_state() as st:
         if has_outstanding_submission(st):
             raise SystemExit("Previous submission is outstanding; inspect it before resetting state.")
+        ledger = submission_ledger(st)
         st.clear()
         st.update(default_state())
+        st["submission_ledger"] = ledger
         st["generation"] = int(now() * 1000)
         add_event(st, "reset", "state cleared by user")
     signal_daemon()
