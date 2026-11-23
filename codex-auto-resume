@@ -404,6 +404,73 @@ def pending_queue_items(tid: str):
     return None if rows is None else [r[0] for r in rows]
 
 
+def turn_has_recorded_work(tid: str, turn_id: str, sent_at: float):
+    if type(sent_at) not in (int, float) or not math.isfinite(sent_at):
+        return None
+    matches = []
+    for path in CODEX_HOME.glob("thread_history_*.sqlite"):
+        try:
+            con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+            try:
+                tables = {row[0] for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('thread_turns','thread_items')"
+                )}
+                if tables != {"thread_turns", "thread_items"}:
+                    continue
+                turn = con.execute("SELECT started_at FROM thread_turns WHERE thread_id=? AND turn_id=?",
+                                   (tid, turn_id)).fetchone()
+                if turn is None:
+                    continue
+                started = turn[0]
+                if type(started) not in (int, float) or not sent_at - 1 <= started <= now() + 1:
+                    matches.append(False)
+                    continue
+                work = con.execute("""
+                    SELECT 1 FROM thread_items
+                    WHERE thread_id=? AND turn_id=? AND created_at_ms>=?
+                      AND CASE WHEN json_valid(item_json) THEN
+                        CASE WHEN item_type IN ('commandExecution','fileChange','mcpToolCall')
+                                  AND json_extract(item_json,'$.status')='completed' THEN 1
+                             WHEN item_type='agentMessage' AND typeof(json_extract(item_json,'$.text'))='text'
+                                  AND length(trim(json_extract(item_json,'$.text')))>0 THEN 1
+                             ELSE 0 END
+                        ELSE 0 END
+                    LIMIT 1
+                """, (tid, turn_id, int((sent_at - 1) * 1000))).fetchone()
+                matches.append(work is not None)
+            finally:
+                con.close()
+        except (OSError, sqlite3.Error, ValueError):
+            return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def record_verified_progress(st: dict, latest: dict) -> bool:
+    tid, before, token, receipt = (st.get(k) for k in
+                                   ("thread_id", "resume_turn_before", "resume_submission_id", "resume_queue_id"))
+    if not all(isinstance(v, str) and v for v in (tid, before, token, receipt)):
+        return False
+    turn_id = latest.get("id")
+    if not isinstance(turn_id, str) or turn_id == before or latest.get("submission_id") != token:
+        return False
+    ledger = submission_ledger(st)
+    record = ledger.get("%s:%s" % (tid, before))
+    if (not isinstance(record, dict) or record.get("thread_id") != tid or record.get("turn_before") != before
+            or record.get("phase") != "queued" or record.get("submission_id") != token
+            or record.get("queue_id") != receipt):
+        return False
+    if "verified_start" in record:
+        return False
+    if turn_has_recorded_work(tid, turn_id, record.get("started_at")) is not True:
+        return False
+    verified_at = now()
+    record["verified_start"] = {"turn_id": turn_id, "verified_at": verified_at, "proof": "native_history_progress"}
+    st["resume_started_turn_id"] = turn_id
+    st["resume_started_verified_at"] = verified_at
+    add_event(st, "resume_progress_verified", "matching turn has recorded work")
+    return True
+
+
 def desktop_server_pids(cfg: dict) -> list:
     cli = Path(cfg["codex_cli"]).resolve()
     app = next((p for p in cli.parents if p.suffix == ".app" and
@@ -875,6 +942,7 @@ def tick(cfg: dict, caf: Caffeinate) -> float:
                     stop(cfg, s, "the matching continuation has an unknown status and needs review")
                     caf.release()
                     return 3600
+                record_verified_progress(s, latest)
                 # An interrupted history projection without completedAt can still be running in Desktop.
                 if status in ("completed", "failed", "interrupted") and not latest.get("completed_at"):
                     if not s.get("resume_projection_pending"):

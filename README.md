@@ -45,6 +45,8 @@ marker and tries opening the thread again if it does not start within 4 minutes.
 is not treated as confirmation. A terminal-looking history entry without a completion timestamp
 is treated as unconfirmed, because the desktop turn may still be running. A queue receipt alone
 is not proof that the task ran.
+When the same marked turn has an actual completed work item or assistant response in native history,
+the helper records that it started work; this is not a claim that it is still running.
 
 **Uncertain submissions:** an unreadable queue or an existing queued message prevents a new send.
 Before any submission, the helper persists an intent. If the process stops or the queue command

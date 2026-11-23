@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -105,6 +106,62 @@ class SubmissionSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ledger unreadable"):
                 app.do_resume(self.cfg, {**self.state, "submission_ledger": []}, self.snap, "after_limit")
             send.assert_not_called()
+
+    def test_recorded_work_requires_exact_turn_and_actual_progress(self):
+        home = Path(self.temp.name)
+        path = home / "thread_history_current.sqlite"
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE thread_turns(thread_id TEXT, turn_id TEXT, started_at INTEGER)")
+            db.execute("CREATE TABLE thread_items(thread_id TEXT, turn_id TEXT, created_at_ms INTEGER, item_type TEXT, item_json TEXT)")
+            db.execute("INSERT INTO thread_turns VALUES(?,?,?)", ("test-thread", "new-turn", 1_000_001))
+            db.execute("INSERT INTO thread_items VALUES(?,?,?,?,?)", ("test-thread", "new-turn", 1_000_002_000,
+                       "userMessage", '{}'))
+        with mock.patch.object(app, "CODEX_HOME", home), mock.patch.object(app, "now", return_value=1_000_100):
+            self.assertFalse(app.turn_has_recorded_work("test-thread", "new-turn", 1_000_000))
+            self.assertIsNone(app.turn_has_recorded_work("test-thread", "wrong-turn", 1_000_000))
+            with sqlite3.connect(path) as db:
+                db.execute("INSERT INTO thread_items VALUES(?,?,?,?,?)", ("test-thread", "new-turn", 1_000_003_000,
+                           "commandExecution", '{"status":"completed"}'))
+            self.assertTrue(app.turn_has_recorded_work("test-thread", "new-turn", 1_000_000))
+            self.assertFalse(app.turn_has_recorded_work("test-thread", "new-turn", 1_000_050))
+            other = home / "thread_history_other.sqlite"
+            with sqlite3.connect(other) as db:
+                db.execute("CREATE TABLE thread_turns(thread_id TEXT, turn_id TEXT, started_at INTEGER)")
+                db.execute("CREATE TABLE thread_items(thread_id TEXT, turn_id TEXT, created_at_ms INTEGER, item_type TEXT, item_json TEXT)")
+                db.execute("INSERT INTO thread_turns VALUES(?,?,?)", ("test-thread", "new-turn", 1_000_001))
+            self.assertIsNone(app.turn_has_recorded_work("test-thread", "new-turn", 1_000_000))
+
+    def test_progress_proof_requires_matching_receipt_and_submission(self):
+        token = "a" * 32
+        record = {"thread_id": "test-thread", "turn_before": "failed-turn", "submission_id": token,
+                  "queue_id": "receipt", "phase": "queued", "started_at": 999_999}
+        state = {**self.state, "resume_turn_before": "failed-turn", "resume_submission_id": token,
+                 "resume_queue_id": "receipt", "submission_ledger": {"test-thread:failed-turn": record}}
+        latest = {"id": "new-turn", "submission_id": token}
+        with mock.patch.object(app, "turn_has_recorded_work", return_value=True) as proof, \
+             mock.patch.object(app, "now", return_value=1_000_000):
+            self.assertTrue(app.record_verified_progress(state, latest))
+            self.assertFalse(app.record_verified_progress(state, latest))
+            proof.assert_called_once_with("test-thread", "new-turn", 999_999)
+        verified = record["verified_start"]
+        self.assertEqual(verified["turn_id"], "new-turn")
+        self.assertEqual(verified["proof"], "native_history_progress")
+        self.assertEqual(state["resume_started_verified_at"], 1_000_000)
+
+    def test_progress_proof_refuses_foreign_marker_or_unknown_history(self):
+        token = "a" * 32
+        record = {"thread_id": "test-thread", "turn_before": "failed-turn", "submission_id": token,
+                  "queue_id": "receipt", "phase": "queued", "started_at": 999_999}
+        state = {**self.state, "resume_turn_before": "failed-turn", "resume_submission_id": token,
+                 "resume_queue_id": "receipt", "submission_ledger": {"test-thread:failed-turn": record}}
+        with mock.patch.object(app, "turn_has_recorded_work", return_value=None) as proof:
+            self.assertFalse(app.record_verified_progress(state, {"id": "new-turn", "submission_id": "b" * 32}))
+            proof.assert_not_called()
+            self.assertFalse(app.record_verified_progress(state, {"id": "new-turn", "submission_id": token}))
+            record["phase"] = "sending"
+            self.assertFalse(app.record_verified_progress(state, {"id": "new-turn", "submission_id": token}))
+            self.assertEqual(proof.call_count, 1)
+        self.assertNotIn("verified_start", record)
 
     def test_missing_queue_database_is_not_created_or_treated_as_empty(self):
         directory = Path(self.temp.name) / "missing-codex-home"
