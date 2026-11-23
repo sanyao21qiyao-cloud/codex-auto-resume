@@ -426,8 +426,7 @@ def lock_holders(cfg: dict, tid: str) -> list:
 
 
 def codex_app_running(cfg: dict) -> bool:
-    return subprocess.run(["/usr/bin/pgrep", "-x", cfg["codex_app_process"]],
-                          stdout=subprocess.DEVNULL).returncode == 0
+    return bool(desktop_server_pids(cfg))
 
 
 def short_title(th: dict) -> str:
@@ -641,7 +640,7 @@ def ensure_loaded(cfg: dict, tid: str) -> str:
     subprocess.run(["/usr/bin/open", "-g", "codex://threads/%s" % tid], timeout=30, check=True)
     if not wait_for_owner(cfg, tid, 45):
         raise AppServerError("Codex Desktop did not open the thread lock file")
-    return "opened via deep link (Codex was %s)" % ("running" if running else "not running; launched")
+    return "opened via deep link (desktop app-server was %s)" % ("running" if running else "not detected")
 
 
 def wait_for_owner(cfg: dict, tid: str, timeout: float) -> bool:
@@ -1171,7 +1170,10 @@ def cmd_doctor(cfg, args):
         print("%s %s" % ("✓" if good else "✗", text))
     line(os.path.exists(cfg["codex_cli"]), "Codex CLI: %s" % cfg["codex_cli"])
     line(daemon_pid() is not None, "daemon running (launchd label %s)" % LABEL)
-    line(codex_app_running(cfg), "Codex Desktop running (not required; it is launched when needed)")
+    try:
+        line(codex_app_running(cfg), "Codex Desktop app-server running (not required; opened when needed)")
+    except AppServerError:
+        line(False, "Codex Desktop app-server could not be inspected")
     try:
         with AppServer(cfg["codex_cli"]) as srv:
             rl = analyze_rate_limits(srv.call("account/rateLimits/read"))

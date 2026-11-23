@@ -260,6 +260,11 @@ with app.mutate_state() as state:
             with self.assertRaisesRegex(app.AppServerError, "did not open"):
                 app.ensure_loaded(self.cfg, "test-thread")
 
+    def test_running_check_uses_desktop_app_server_detection(self):
+        with mock.patch.object(app, "desktop_server_pids", side_effect=[[102], []]):
+            self.assertTrue(app.codex_app_running(self.cfg))
+            self.assertFalse(app.codex_app_running(self.cfg))
+
 
 if __name__ == "__main__":
     unittest.main()
