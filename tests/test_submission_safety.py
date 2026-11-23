@@ -265,6 +265,46 @@ with app.mutate_state() as state:
             self.assertTrue(app.codex_app_running(self.cfg))
             self.assertFalse(app.codex_app_running(self.cfg))
 
+    def test_available_quota_ignores_stale_error_reset_time(self):
+        state = {}
+        windows = [{"used": 10, "resets_at": 1_010_000, "mins": minutes}
+                   for minutes in (300, 10080)]
+        with mock.patch.object(app, "now", return_value=1_000_000), \
+             mock.patch.object(app, "parse_try_again", return_value=1_086_400):
+            app.schedule_from_limit(self.cfg, state, {"error_message": "old limit"},
+                                    {"allowed": True, "reset_at": None, "windows": windows})
+        self.assertEqual(state["reset_at"], 1_000_090)
+        self.assertEqual(state["reset_source"], "usage already available")
+
+    def test_unknown_quota_never_submits_automatically(self):
+        state = {**self.state, "phase": "waiting_reset", "limit_turn_id": "failed-turn",
+                 "reset_at": 999_999, "next_check_at": 0}
+        app.save_state(state)
+        server = mock.MagicMock()
+        server.__enter__.return_value.call.return_value = {"ordinaryUsageAllowed": None}
+        snap = {"latest": {"id": "failed-turn"}, "goal": None}
+        with mock.patch.object(app, "now", return_value=1_000_000), \
+             mock.patch.object(app, "AppServer", return_value=server), \
+             mock.patch.object(app, "read_snapshot", return_value=snap), \
+             mock.patch.object(app, "classify", return_value=("limited", "quota limit")), \
+             mock.patch.object(app, "do_resume") as send:
+            app.tick(self.cfg, mock.Mock())
+            send.assert_not_called()
+        self.assertEqual(app.load_state()["phase"], "waiting_reset")
+
+    def test_exhausted_window_blocks_even_if_allowed_flag_is_true(self):
+        self.assertFalse(app.quota_available({"allowed": True, "reset_at": 1_000_100}))
+
+    def test_missing_or_stale_quota_windows_never_authorize_a_send(self):
+        base = {"allowed": True, "reset_at": None}
+        with mock.patch.object(app, "now", return_value=1_000_000):
+            self.assertFalse(app.quota_available(base))
+            self.assertFalse(app.quota_available({**base, "windows": [
+                {"used": 10, "resets_at": 1_010_000, "mins": 300}]}))
+            self.assertFalse(app.quota_available({**base, "windows": [
+                {"used": 100, "resets_at": 999_999, "mins": 300},
+                {"used": 10, "resets_at": 1_010_000, "mins": 10080}]}))
+
 
 if __name__ == "__main__":
     unittest.main()

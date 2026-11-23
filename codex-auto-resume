@@ -23,6 +23,7 @@ import fcntl
 import json
 import logging
 import logging.handlers
+import math
 import os
 import queue
 import re
@@ -487,6 +488,25 @@ def analyze_rate_limits(rl: dict | None) -> dict:
     return out
 
 
+def quota_available(rl: dict | None) -> bool:
+    if not rl or rl.get("allowed") is not True or rl.get("reset_at") is not None:
+        return False
+    windows = rl.get("windows")
+    if not isinstance(windows, list):
+        return False
+    durations = set()
+    for window in windows:
+        if not isinstance(window, dict):
+            return False
+        used, reset, minutes = (window.get(k) for k in ("used", "resets_at", "mins"))
+        if not all(type(v) in (int, float) and math.isfinite(v) for v in (used, reset, minutes)):
+            return False
+        if not 0 <= used < 100 or reset <= now():
+            return False
+        durations.add(minutes)
+    return {300, 10080}.issubset(durations)
+
+
 _MONTHS = "%b %d, %Y %I:%M %p"
 
 
@@ -726,20 +746,18 @@ def stop(cfg: dict, st: dict, reason: str, complete: bool = False) -> None:
 
 def schedule_from_limit(cfg: dict, st: dict, latest: dict, rl: dict) -> None:
     t = now()
-    candidates, source = [], None
-    if rl["reset_at"]:
-        candidates.append(rl["reset_at"]); source = "rate-limit window"
-    msg_ts = parse_try_again(latest.get("error_message"))
-    if msg_ts and msg_ts > t:
-        candidates.append(msg_ts); source = source or "Codex message"
     level = st.get("backoff_level", 0)
     backoff = cfg["backoff_secs"][min(level, len(cfg["backoff_secs"]) - 1)]
-    if candidates:
-        resume_at = max(candidates) + cfg["reset_grace_secs"]
-    elif rl["allowed"] is True:
+    if quota_available(rl):
         resume_at, source = t + cfg["reset_grace_secs"], "usage already available"
+    elif rl["reset_at"]:
+        resume_at, source = rl["reset_at"] + cfg["reset_grace_secs"], "rate-limit window"
     else:
-        resume_at, source = t + backoff, "backoff (no reset time known)"
+        msg_ts = parse_try_again(latest.get("error_message"))
+        if msg_ts and msg_ts > t:
+            resume_at, source = msg_ts + cfg["reset_grace_secs"], "Codex message"
+        else:
+            resume_at, source = t + backoff, "backoff (no reset time known)"
     # A resume that immediately hit the limit again: never retry faster than the backoff step.
     if st.get("last_resume_at") and t - st["last_resume_at"] < 900:
         resume_at = max(resume_at, t + backoff)
@@ -846,12 +864,12 @@ def tick(cfg: dict, caf: Caffeinate) -> float:
             else:
                 s["phase"] = "waiting_reset"
                 reset_at = s.get("reset_at") or 0
-                if rl["allowed"] is True and now() < reset_at - cfg["reset_grace_secs"]:
+                if quota_available(rl) and now() < reset_at - cfg["reset_grace_secs"]:
                     # Usage came back early (e.g. you redeemed a reset); give it the normal grace period.
                     s.update(reset_at=now() + cfg["reset_grace_secs"], reset_source="usage available early")
                     add_event(s, "reset_early", "usage available again; resuming %s" % fmt_time(s["reset_at"]))
                     s["next_check_at"] = s["reset_at"]
-                elif now() >= reset_at and rl["allowed"] is False:
+                elif now() >= reset_at and not quota_available(rl):
                     schedule_from_limit(cfg, s, latest, rl)
                     add_event(s, "reset_rescheduled", "usage not yet available; next try %s" % fmt_time(s["reset_at"]))
                 elif now() >= reset_at:
@@ -859,7 +877,7 @@ def tick(cfg: dict, caf: Caffeinate) -> float:
                 else:
                     s["next_check_at"] = min(reset_at, now() + cfg["poll_waiting_secs"])
         elif verdict == "continue":
-            if rl and rl["allowed"] is False:
+            if not quota_available(rl):
                 schedule_from_limit(cfg, s, latest, rl)
                 add_event(s, "usage_limit", "usage not available; resume %s" % fmt_time(s["reset_at"]))
             else:
@@ -1047,8 +1065,8 @@ def cmd_resume_now(cfg, args):
         if input("Codex is not stopped at a usage limit (%s).\nIt may already be finished. Send the continuation anyway? [y/N] "
                  % reason).strip().lower() not in ("y", "yes"):
             raise SystemExit("Nothing sent.")
-    if rl["allowed"] is False and not args.force:
-        raise SystemExit("Codex reports usage is not available yet (reset %s). Use --force to send anyway." % fmt_time(rl["reset_at"]))
+    if not quota_available(rl) and not args.force:
+        raise SystemExit("Codex usage is not confirmed available (reset %s). Use --force to send anyway." % fmt_time(rl["reset_at"]))
     with mutate_state() as s:
         if s["generation"] != st["generation"]:
             raise SystemExit("State changed meanwhile; try again.")

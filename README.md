@@ -37,7 +37,8 @@ ended with a usage-limit error, or you run `resume-now` yourself.
 
 **When it resumes:** it waits for the reset time Codex reports, plus a 90-second grace. If no
 reset time is known, or a resume hits the limit again, it backs off: 10, 20, 40, 60, then 120
-minutes.
+minutes. Current confirmed five-hour and weekly quota takes precedence over an old error message;
+missing, expired or exhausted quota windows do not authorize an automatic send.
 
 **Checking it worked:** after queueing, it watches for a new turn and tries opening the thread
 again if it does not start within 4 minutes. A queue receipt alone is not proof that the task ran.
