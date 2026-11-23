@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 VERSION = "1.0.0"
@@ -220,6 +221,19 @@ def has_unresolved_submission(st: dict) -> bool:
     return "unresolved_submission" in st or st.get("phase") == "submission_unknown"
 
 
+def has_outstanding_submission(st: dict) -> bool:
+    return has_unresolved_submission(st) or st.get("phase") == "resuming"
+
+
+def preserve_outstanding_submission(st: dict, reason: str) -> None:
+    if st.get("phase") == "resuming":
+        st["unresolved_submission"] = {
+            "thread_id": st.get("thread_id"), "turn_before": st.get("resume_turn_before"),
+            "queue_id": st.get("resume_queue_id"), "submission_id": st.get("resume_submission_id"),
+            "started_at": st.get("last_resume_at"), "reason": reason,
+        }
+
+
 def signal_daemon() -> bool:
     try:
         pid = int(PID_PATH.read_text().strip())
@@ -335,6 +349,7 @@ def summarize_turn(t: dict) -> dict:
                 first_text = c.get("text") or ""
                 break
     err = t.get("error")
+    marker = re.search(r"(?m)^" + re.escape(MARKER) + r" submission=([0-9a-f]{32})$", first_text)
     return {
         "id": t["id"],
         "status": t.get("status"),
@@ -343,6 +358,7 @@ def summarize_turn(t: dict) -> dict:
         "started_at": t.get("startedAt"),
         "completed_at": t.get("completedAt"),
         "by_helper": first_text.startswith(MARKER),
+        "submission_id": marker.group(1) if marker else None,
         "has_user_message": bool(users),
     }
 
@@ -693,7 +709,7 @@ def queue_is_clear(cfg: dict, st: dict, tid: str) -> bool:
 def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> bool:
     """Send exactly one continuation to the armed thread. Caller holds the state lock."""
     tid = st["thread_id"]
-    if has_unresolved_submission(st):
+    if has_outstanding_submission(st):
         add_event(st, "submission_unknown", "previous submission requires review; not sending")
         return False
     if st.get("resume_count", 0) >= st.get("max_resumes", cfg["max_resumes"]):
@@ -702,10 +718,12 @@ def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> bool:
     if not queue_is_clear(cfg, st, tid):
         return False
     latest = snap.get("latest") or {}
-    prompt = build_prompt(st, cfg)
+    submission_id = uuid.uuid4().hex
+    prompt = build_prompt(st, cfg) + "\n\n%s submission=%s" % (MARKER, submission_id)
     previous_phase = st.get("phase")
     st.update(phase="submission_unknown", unresolved_submission={
         "thread_id": tid, "turn_before": latest.get("id"), "kind": kind, "started_at": now(),
+        "submission_id": submission_id,
     })
     # Persist before any side effect; an interrupted attempt must never be retried blindly.
     save_state(st)
@@ -726,6 +744,7 @@ def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> bool:
     qid = codex_queue(cfg, tid, prompt)
     st["resume_count"] = st.get("resume_count", 0) + 1
     st.update(phase="resuming", resume_kind=kind, resume_queue_id=qid, resume_turn_before=latest.get("id"),
+              resume_submission_id=submission_id,
               last_resume_at=now(), resume_deadline=now() + cfg["resume_verify_secs"], resume_attempts=1,
               next_check_at=now() + cfg["poll_resuming_secs"])
     st.pop("unresolved_submission", None)
@@ -815,9 +834,26 @@ def tick(cfg: dict, caf: Caffeinate) -> float:
 
         if phase == "resuming":
             if latest.get("id") and latest.get("id") != s.get("resume_turn_before"):
-                add_event(s, "resume_confirmed", "new turn %s started" % latest["id"][-12:])
-                if s.get("resume_kind") != "followup":
-                    notify(cfg, "Codex task resumed", s.get("thread_title") or tid)
+                expected = s.get("resume_submission_id")
+                if not expected or latest.get("submission_id") != expected:
+                    preserve_outstanding_submission(s, "different_turn")
+                    stop(cfg, s, "a different turn appeared; the queued continuation may still run and needs review")
+                    caf.release()
+                    return 3600
+                status = latest.get("status")
+                if status not in ("inProgress", "completed", "failed", "interrupted"):
+                    preserve_outstanding_submission(s, "turn_status_unknown")
+                    stop(cfg, s, "the matching continuation has an unknown status and needs review")
+                    caf.release()
+                    return 3600
+                if status in ("inProgress", "completed"):
+                    add_event(s, "resume_confirmed", "new turn %s started" % latest["id"][-12:])
+                    s["resume_started_turn_id"] = latest["id"]
+                    s["resume_started_verified_at"] = now()
+                    if s.get("resume_kind") != "followup":
+                        notify(cfg, "Codex task resumed", s.get("thread_title") or tid)
+                else:
+                    add_event(s, "resume_ended", "matching continuation ended with status %s" % status)
                 s["phase"] = "working"
             elif now() < s.get("resume_deadline", 0):
                 s["next_check_at"] = now() + cfg["poll_resuming_secs"]
@@ -831,8 +867,9 @@ def tick(cfg: dict, caf: Caffeinate) -> float:
                 return cfg["poll_resuming_secs"]
             else:
                 pend = pending_queue_items(tid)
-                stop(cfg, s, "the continuation was queued but Codex did not start it%s" % (
-                    " (it will run when you open the thread in Codex)" if pend else ""))
+                preserve_outstanding_submission(s, "start_unconfirmed")
+                stop(cfg, s, "could not verify that the queued continuation started%s" % (
+                    " (it may still run when you open the thread in Codex)" if pend else ""))
                 caf.release()
                 return 3600
 
@@ -974,8 +1011,8 @@ def cmd_threads(cfg, args):
 
 
 def cmd_arm(cfg, args):
-    if has_unresolved_submission(load_state()):
-        raise SystemExit("Previous submission is unresolved; inspect it before arming another thread.")
+    if has_outstanding_submission(load_state()):
+        raise SystemExit("Previous submission is outstanding; inspect it before arming another thread.")
     if args.thread:
         t = resolve_thread(cfg, args.thread)
     else:
@@ -999,8 +1036,8 @@ def cmd_arm(cfg, args):
         raise SystemExit("The thread's goal is %s; resume it in Codex first (or pass --force)." % goal["status"])
     latest = snap.get("latest")
     with mutate_state() as st:
-        if has_unresolved_submission(st):
-            raise SystemExit("Previous submission is unresolved; inspect it before arming another thread.")
+        if has_outstanding_submission(st):
+            raise SystemExit("Previous submission is outstanding; inspect it before arming another thread.")
         hist = st.get("history", [])
         st.clear()
         st.update(default_state())
@@ -1027,10 +1064,15 @@ def cmd_arm(cfg, args):
 def cmd_disarm(cfg, args):
     with mutate_state() as st:
         was = st.get("armed")
+        queued = st.get("phase") == "resuming"
+        preserve_outstanding_submission(st, "disarmed")
         st.update(armed=False, phase="disarmed", generation=int(now() * 1000))
         add_event(st, "disarmed", "by user")
     signal_daemon()
-    print("Disarmed." if was else "Was not armed.")
+    if queued:
+        print("Disarmed, but the queued message may still run; inspect it before trying again.")
+    else:
+        print("Disarmed." if was else "Was not armed.")
 
 
 def cmd_cancel(cfg, args):
@@ -1038,19 +1080,25 @@ def cmd_cancel(cfg, args):
         if st.get("phase") not in ("waiting_reset", "resuming"):
             print("Nothing scheduled (phase: %s)." % st.get("phase"))
             return
+        queued = st.get("phase") == "resuming"
+        preserve_outstanding_submission(st, "cancelled")
         st["cancelled_turn_id"] = st.get("limit_turn_id")
-        st.update(phase="idle", generation=int(now() * 1000), next_check_at=0)
-        add_event(st, "cancelled", "scheduled resume cancelled; still armed for future limit events")
+        st.update(phase="submission_unknown" if queued else "idle", generation=int(now() * 1000), next_check_at=0)
+        add_event(st, "cancelled", "queued message requires review" if queued else
+                  "scheduled resume cancelled; still armed for future limit events")
     signal_daemon()
-    print("Scheduled resume cancelled. Still armed for future usage-limit events (use `disarm` to stop entirely).")
+    if queued:
+        print("The queued message may still run; inspect it before trying again.")
+    else:
+        print("Scheduled resume cancelled. Still armed for future usage-limit events (use `disarm` to stop entirely).")
 
 
 def cmd_resume_now(cfg, args):
     st = load_state()
     if not st.get("armed"):
         raise SystemExit("Not armed. Arm a thread first.")
-    if has_unresolved_submission(st):
-        raise SystemExit("Previous submission is unresolved; inspect it before sending again.")
+    if has_outstanding_submission(st):
+        raise SystemExit("Previous submission is outstanding; inspect it before sending again.")
     with AppServer(cfg["codex_cli"]) as srv:
         snap = read_snapshot(srv, st["thread_id"])
         rl = analyze_rate_limits(srv.call("account/rateLimits/read"))
@@ -1149,8 +1197,8 @@ def cmd_logs(cfg, args):
 
 def cmd_reset(cfg, args):
     with mutate_state() as st:
-        if has_unresolved_submission(st):
-            raise SystemExit("Previous submission is unresolved; inspect it before resetting state.")
+        if has_outstanding_submission(st):
+            raise SystemExit("Previous submission is outstanding; inspect it before resetting state.")
         st.clear()
         st.update(default_state())
         st["generation"] = int(now() * 1000)

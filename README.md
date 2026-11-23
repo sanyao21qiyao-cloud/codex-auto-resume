@@ -40,14 +40,17 @@ reset time is known, or a resume hits the limit again, it backs off: 10, 20, 40,
 minutes. Current confirmed five-hour and weekly quota takes precedence over an old error message;
 missing, expired or exhausted quota windows do not authorize an automatic send.
 
-**Checking it worked:** after queueing, it watches for a new turn and tries opening the thread
-again if it does not start within 4 minutes. A queue receipt alone is not proof that the task ran.
+**Checking it worked:** after queueing, it watches for a turn containing this submission's unique
+marker and tries opening the thread again if it does not start within 4 minutes. A different turn
+is not treated as confirmation. A queue receipt alone is not proof that the task ran.
 
 **Uncertain submissions:** an unreadable queue or an existing queued message prevents a new send.
 Before any submission, the helper persists an intent. If the process stops or the queue command
 fails before a receipt is recorded, the attempt stays unresolved and is never sent again
 automatically. Inspect the thread and its queue before any manual recovery; disarming does not
 erase the unresolved intent, and arming or resetting is blocked while it remains unresolved.
+Disarming or cancelling does not remove a message already accepted by the Codex queue; it may
+still run and must be inspected separately.
 An open lock file alone does not prove exclusive ownership or that the thread is idle. The queue
 API does not provide an atomic check against intervening user actions.
 

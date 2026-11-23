@@ -84,6 +84,7 @@ class SubmissionSafetyTests(unittest.TestCase):
             intent = app.load_state()["unresolved_submission"]
             self.assertEqual(intent["thread_id"], "test-thread")
             self.assertEqual(intent["turn_before"], "failed-turn")
+            self.assertIn("submission=" + intent["submission_id"], prompt)
             return "queue-receipt"
 
         with mock.patch.object(app, "pending_queue_items", return_value=[]), \
@@ -94,6 +95,7 @@ class SubmissionSafetyTests(unittest.TestCase):
         saved = app.load_state()
         self.assertEqual(saved["phase"], "resuming")
         self.assertEqual(saved["resume_queue_id"], "queue-receipt")
+        self.assertEqual(len(saved["resume_submission_id"]), 32)
         self.assertNotIn("unresolved_submission", saved)
 
     def test_lost_receipt_blocks_automatic_and_manual_retries(self):
@@ -304,6 +306,93 @@ with app.mutate_state() as state:
             self.assertFalse(app.quota_available({**base, "windows": [
                 {"used": 100, "resets_at": 999_999, "mins": 300},
                 {"used": 10, "resets_at": 1_010_000, "mins": 10080}]}))
+
+    def test_submission_marker_is_extracted_from_the_actual_user_message(self):
+        token = "a" * 32
+        turn = {"id": "new-turn", "items": [{"type": "userMessage", "content": [
+            {"type": "text", "text": "continue\n\n[codex-auto-resume] submission=" + token}]}]}
+        self.assertEqual(app.summarize_turn(turn)["submission_id"], token)
+        turn["items"][0]["content"][0]["text"] = "an unrelated message"
+        self.assertIsNone(app.summarize_turn(turn)["submission_id"])
+
+    def test_only_matching_submission_can_confirm_resume(self):
+        token = "a" * 32
+        for actual, expected_phase in ((token, "working"), ("b" * 32, "stopped"), (None, "stopped")):
+            with self.subTest(actual=actual):
+                state = {**self.state, "phase": "resuming", "resume_turn_before": "failed-turn",
+                         "resume_submission_id": token, "resume_kind": "after_limit",
+                         "resume_deadline": 1_000_100, "next_check_at": 0}
+                app.save_state(state)
+                server = mock.MagicMock()
+                snap = {"latest": {"id": "new-turn", "submission_id": actual,
+                                   "status": "inProgress"}, "goal": None}
+                cfg = dict(self.cfg, notifications=False)
+                with mock.patch.object(app, "now", return_value=1_000_000), \
+                     mock.patch.object(app, "AppServer", return_value=server), \
+                     mock.patch.object(app, "read_snapshot", return_value=snap), \
+                     mock.patch.object(app, "classify", return_value=("working", "running")):
+                    app.tick(cfg, mock.Mock())
+                saved = app.load_state()
+                self.assertEqual(saved["phase"], expected_phase)
+                self.assertEqual(saved.get("resume_started_turn_id"),
+                                 "new-turn" if actual == token else None)
+                self.assertEqual(app.has_unresolved_submission(saved), actual != token)
+
+    def test_failed_matching_turn_is_not_announced_as_resumed(self):
+        token = "a" * 32
+        state = {**self.state, "phase": "resuming", "resume_turn_before": "failed-turn",
+                 "resume_submission_id": token, "resume_kind": "after_limit", "next_check_at": 0}
+        app.save_state(state)
+        server = mock.MagicMock()
+        snap = {"latest": {"id": "new-turn", "submission_id": token, "status": "failed"}, "goal": None}
+        with mock.patch.object(app, "AppServer", return_value=server), \
+             mock.patch.object(app, "read_snapshot", return_value=snap), \
+             mock.patch.object(app, "classify", return_value=("stop", "turn failed")), \
+             mock.patch.object(app, "notify") as notify:
+            app.tick(self.cfg, mock.Mock())
+        saved = app.load_state()
+        self.assertNotIn("resume_started_verified_at", saved)
+        self.assertNotIn("resume_confirmed", [event["event"] for event in saved["history"]])
+        self.assertNotIn("Codex task resumed", [call.args[1] for call in notify.call_args_list])
+
+    def test_queued_submission_is_preserved_when_disarmed_or_cancelled(self):
+        for command in (app.cmd_disarm, app.cmd_cancel):
+            with self.subTest(command=command.__name__):
+                state = {**self.state, "phase": "resuming", "resume_queue_id": "queue-receipt",
+                         "resume_submission_id": "a" * 32, "resume_turn_before": "failed-turn"}
+                app.save_state(state)
+                with mock.patch.object(app, "signal_daemon"):
+                    command(self.cfg, None)
+                saved = app.load_state()
+                self.assertTrue(app.has_unresolved_submission(saved))
+                self.assertEqual(saved["unresolved_submission"]["queue_id"], "queue-receipt")
+                with self.assertRaises(SystemExit):
+                    app.cmd_reset(self.cfg, None)
+
+    def test_manually_sending_or_rearming_while_queued_is_blocked(self):
+        app.save_state({**self.state, "phase": "resuming", "resume_queue_id": "queue-receipt"})
+        with self.assertRaises(SystemExit):
+            app.cmd_resume_now(self.cfg, SimpleNamespace(force=True, yes=True))
+        with self.assertRaises(SystemExit):
+            app.cmd_arm(self.cfg, SimpleNamespace(thread="test-thread"))
+
+    def test_unconfirmed_start_keeps_the_submission_for_review(self):
+        state = {**self.state, "phase": "resuming", "resume_turn_before": "failed-turn",
+                 "resume_queue_id": "queue-receipt", "resume_attempts": 2,
+                 "resume_deadline": 999_999, "next_check_at": 0}
+        app.save_state(state)
+        server = mock.MagicMock()
+        snap = {"latest": {"id": "failed-turn"}, "goal": None}
+        with mock.patch.object(app, "now", return_value=1_000_000), \
+             mock.patch.object(app, "AppServer", return_value=server), \
+             mock.patch.object(app, "read_snapshot", return_value=snap), \
+             mock.patch.object(app, "classify", return_value=("working", "running")), \
+             mock.patch.object(app, "pending_queue_items", return_value=[]):
+            app.tick(dict(self.cfg, notifications=False), mock.Mock())
+        saved = app.load_state()
+        self.assertEqual(saved["phase"], "stopped")
+        self.assertEqual(saved["unresolved_submission"]["reason"], "start_unconfirmed")
+        self.assertEqual(saved["unresolved_submission"]["queue_id"], "queue-receipt")
 
 
 if __name__ == "__main__":
