@@ -21,7 +21,8 @@ $ codex-auto-resume disarm
 Everything goes through Codex's own local interfaces; there's no UI automation.
 
 - **Reading state:** a short-lived private `codex app-server` (JSON-RPC over stdio) is asked for
-  the thread, its turns, any thread goal, and your account's rate limits.
+  the thread, its turns, queue, any thread goal, and your account's rate limits. Archive state
+  is checked in structurally compatible state databases, without selecting a database by version.
 - **Spotting the limit:** a usage limit is recognised from the structured turn error
   (`codexErrorInfo == usageLimitExceeded`), or from a thread goal in status `usageLimited`.
 - **Resuming:** it runs `codex queue --thread <id> --message <prompt>`. That is Codex's own

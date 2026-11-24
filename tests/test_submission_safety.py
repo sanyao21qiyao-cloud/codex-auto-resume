@@ -163,10 +163,10 @@ class SubmissionSafetyTests(unittest.TestCase):
             self.assertEqual(proof.call_count, 1)
         self.assertNotIn("verified_start", record)
 
-    def test_missing_queue_database_is_not_created_or_treated_as_empty(self):
+    def test_unavailable_queue_api_is_not_treated_as_empty(self):
         directory = Path(self.temp.name) / "missing-codex-home"
         with mock.patch.object(app, "CODEX_HOME", directory), \
-             mock.patch.object(app.time, "sleep"), \
+             mock.patch.object(app, "AppServer", side_effect=app.AppServerError("unavailable")), \
              mock.patch.object(app, "ensure_loaded") as load, \
              mock.patch.object(app, "codex_queue") as send:
             with app.mutate_state() as state:
@@ -174,6 +174,61 @@ class SubmissionSafetyTests(unittest.TestCase):
             load.assert_not_called()
             send.assert_not_called()
             self.assertFalse(directory.exists())
+
+    def test_queue_api_requires_valid_response_and_does_not_read_message_content(self):
+        server = mock.MagicMock()
+        call = server.__enter__.return_value.call
+        with mock.patch.object(app, "AppServer", return_value=server):
+            for result, expected in (({"data": []}, []), ({"data": [{"id": "receipt"}]}, ["receipt"]),
+                                     ([], None),
+                                     ({"data": None}, None), ({"data": [{}]}, None),
+                                     ({"data": [], "nextCursor": "unexpected"}, None)):
+                with self.subTest(result=result):
+                    call.return_value = result
+                    self.assertEqual(app.pending_queue_items(self.cfg, "test-thread"), expected)
+                    call.assert_called_with("thread/queue/list", {"threadId": "test-thread", "limit": 1})
+
+    def test_server_initialization_failure_closes_the_process(self):
+        with mock.patch.object(app.os.path, "exists", return_value=True), \
+             mock.patch.object(app.subprocess, "Popen"), \
+             mock.patch.object(app.threading, "Thread"), \
+             mock.patch.object(app.AppServer, "call", side_effect=app.AppServerError("unsupported")), \
+             mock.patch.object(app.AppServer, "close") as close:
+            with self.assertRaises(app.AppServerError):
+                app.AppServer("/fake/codex")
+            close.assert_called_once()
+
+    def test_archive_state_is_found_by_schema_not_database_version(self):
+        home = Path(self.temp.name)
+        path = home / "state_future.sqlite"
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE threads(id TEXT, archived INTEGER)")
+            db.execute("INSERT INTO threads VALUES(?,?)", ("test-thread", 0))
+        with mock.patch.object(app, "CODEX_HOME", home):
+            self.assertFalse(app.thread_archived("test-thread"))
+            self.assertIsNone(app.thread_archived("missing"))
+            with sqlite3.connect(path) as db:
+                db.execute("UPDATE threads SET archived=1")
+            self.assertTrue(app.thread_archived("test-thread"))
+            other = home / "state_other.sqlite"
+            with sqlite3.connect(other) as db:
+                db.execute("CREATE TABLE threads(id TEXT, archived INTEGER)")
+                db.execute("INSERT INTO threads VALUES(?,?)", ("test-thread", 0))
+            self.assertIsNone(app.thread_archived("test-thread"))
+
+    def test_snapshot_refuses_unknown_archive_state(self):
+        server = mock.Mock()
+        server.call.return_value = {"thread": {"id": "test-thread"}}
+        with mock.patch.object(app, "thread_archived", return_value=None):
+            with self.assertRaisesRegex(app.AppServerError, "archive status unavailable"):
+                app.read_snapshot(server, "test-thread")
+
+    def test_archived_session_path_is_never_treated_as_active(self):
+        server = mock.Mock()
+        server.call.side_effect = [{"thread": {"id": "test-thread", "path": "/home/archived_sessions/task.jsonl"}},
+                                   {"data": []}, {"goal": None}]
+        with mock.patch.object(app, "thread_archived", return_value=False):
+            self.assertTrue(app.read_snapshot(server, "test-thread")["archived"])
 
     def test_queue_change_while_loading_prevents_submission(self):
         for second_read in (None, ["another-queued-message"]):
@@ -278,7 +333,7 @@ loader.exec_module(app)
 app.APP_DIR = pathlib.Path(sys.argv[2])
 app.STATE_PATH = app.APP_DIR / 'state.json'
 app.LOCK_PATH = app.APP_DIR / 'state.lock'
-app.pending_queue_items = lambda thread: []
+app.pending_queue_items = lambda cfg, thread: []
 app.ensure_loaded = lambda cfg, thread: 'loaded'
 app.codex_queue = lambda cfg, thread, prompt: os._exit(73)
 with app.mutate_state() as state:

@@ -285,8 +285,13 @@ class AppServer:
         self.responses: "queue.Queue[dict]" = queue.Queue()
         self.next_id = 0
         threading.Thread(target=self._reader, daemon=True).start()
-        self.call("initialize", {"clientInfo": {"name": "codex-auto-resume", "version": VERSION}})
-        self._send({"jsonrpc": "2.0", "method": "initialized"})
+        try:
+            self.call("initialize", {"clientInfo": {"name": "codex-auto-resume", "version": VERSION},
+                                     "capabilities": {"experimentalApi": True}})
+            self._send({"jsonrpc": "2.0", "method": "initialized"})
+        except BaseException:
+            self.close()
+            raise
 
     def _send(self, msg: dict) -> None:
         assert self.p.stdin is not None
@@ -378,30 +383,40 @@ def summarize_turn(t: dict) -> dict:
     }
 
 
-def sqlite_ro(db: Path, sql: str, args=()):
-    for attempt in range(3):
+def thread_archived(tid: str):
+    matches = []
+    for path in CODEX_HOME.glob("state_*.sqlite"):
         try:
-            con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
+            con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
             try:
-                return con.execute(sql, args).fetchall()
+                columns = {row[1] for row in con.execute("PRAGMA table_info(threads)")}
+                if not {"id", "archived"}.issubset(columns):
+                    continue
+                row = con.execute("SELECT archived FROM threads WHERE id=?", (tid,)).fetchone()
+                if row is not None:
+                    if type(row[0]) is not int or row[0] not in (0, 1):
+                        return None
+                    matches.append(bool(row[0]))
             finally:
                 con.close()
-        except sqlite3.Error:
-            time.sleep(0.5 * (attempt + 1))
-    return None
+        except (OSError, sqlite3.Error, ValueError):
+            return None
+    return matches[0] if matches and all(value == matches[0] for value in matches) else None
 
 
-def thread_archived(tid: str, path: str | None):
-    rows = sqlite_ro(CODEX_HOME / "state_5.sqlite", "select archived from threads where id=?", (tid,))
-    if rows:
-        return bool(rows[0][0])
-    return bool(path and "/archived_sessions/" in path)
-
-
-def pending_queue_items(tid: str):
-    rows = sqlite_ro(CODEX_HOME / "queue_1.sqlite",
-                     "select id, created_at_ms from queued_items where thread_id=? order by queue_order", (tid,))
-    return None if rows is None else [r[0] for r in rows]
+def pending_queue_items(cfg: dict, tid: str):
+    try:
+        with AppServer(cfg["codex_cli"]) as srv:
+            result = srv.call("thread/queue/list", {"threadId": tid, "limit": 1})
+        if not isinstance(result, dict):
+            return None
+        items = result.get("data")
+        if not isinstance(items, list) or (not items and result.get("nextCursor")):
+            return None
+        ids = [item.get("id") for item in items if isinstance(item, dict)]
+        return ids if len(ids) == len(items) and all(isinstance(v, str) and v for v in ids) else None
+    except (AppServerError, OSError, ValueError):
+        return None
 
 
 def turn_has_recorded_work(tid: str, turn_id: str, sent_at: float):
@@ -549,7 +564,11 @@ def read_snapshot(srv: AppServer, tid: str) -> dict:
     snap["title"] = short_title(th)
     snap["cwd"] = th.get("cwd")
     snap["path"] = th.get("path")
-    snap["archived"] = thread_archived(tid, th.get("path"))
+    snap["archived"] = thread_archived(tid)
+    if isinstance(snap["path"], str) and "/archived_sessions/" in snap["path"]:
+        snap["archived"] = True
+    if snap["archived"] is None:
+        raise AppServerError("thread archive status unavailable")
     turns = srv.call("thread/turns/list", {"threadId": tid, "limit": 3}).get("data") or []
     snap["turns"] = [summarize_turn(t) for t in turns]  # newest first
     snap["latest"] = snap["turns"][0] if snap["turns"] else None
@@ -779,7 +798,7 @@ def reactivate_goal(cfg: dict, tid: str) -> str:
 
 
 def queue_is_clear(cfg: dict, st: dict, tid: str) -> bool:
-    pending = pending_queue_items(tid)
+    pending = pending_queue_items(cfg, tid)
     if pending is None or pending:
         st["next_check_at"] = now() + cfg["poll_resuming_secs"]
         if pending is None:
@@ -972,7 +991,7 @@ def tick(cfg: dict, caf: Caffeinate) -> float:
                 add_event(s, "resume_retry_open", ensure_loaded(cfg, tid))
                 return cfg["poll_resuming_secs"]
             else:
-                pend = pending_queue_items(tid)
+                pend = pending_queue_items(cfg, tid)
                 preserve_outstanding_submission(s, "start_unconfirmed")
                 stop(cfg, s, "could not verify that the queued continuation started%s" % (
                     " (it may still run when you open the thread in Codex)" if pend else ""))
@@ -1292,7 +1311,7 @@ def cmd_check(cfg, args):
     for t in snap.get("turns", []):
         print("turn:       %s %-11s %s%s" % (t["id"][-12:], t["status"], t["error_code"] or "", "  (sent by helper)" if t["by_helper"] else ""))
     print("lock open:  %s" % (lock_holders(cfg, tid) or "not open by Codex Desktop (would deep-link)"))
-    print("queued:     %s" % pending_queue_items(tid))
+    print("queued:     %s" % pending_queue_items(cfg, tid))
     print("usage:      allowed=%s  exhausted-window reset=%s" % (rl["allowed"], fmt_time(rl["reset_at"])))
     if snap.get("latest") and snap["latest"].get("error_message"):
         print("limit msg:  try-again parsed as %s" % fmt_time(parse_try_again(snap["latest"]["error_message"])))
@@ -1361,7 +1380,14 @@ def cmd_doctor(cfg, args):
         line(True, "app-server reachable; usage allowed=%s" % rl["allowed"])
     except Exception as e:
         line(False, "app-server: %s" % e)
-    line(pending_queue_items("00000000-0000-0000-0000-000000000000") is not None, "Codex queue database readable")
+    target = load_state().get("thread_id")
+    if not target:
+        try:
+            threads = list_threads(cfg, 1)
+            target = threads[0]["id"] if threads else None
+        except AppServerError:
+            target = None
+    line(bool(target) and pending_queue_items(cfg, target) is not None, "Codex queue API readable")
     return 0 if ok else 1
 
 
